@@ -1,0 +1,146 @@
+\section{Experiments}
+
+\subsection{Research Questions}
+
+\begin{itemize}
+    \item[\textbf{RQ1}] Does the world-model agent learn faster or reach higher return than Recurrent PPO on \textsc{MemoryS11} (recall-heavy POMDP)?
+    \item[\textbf{RQ2}] Does the world-model agent confer an advantage on \textsc{DoorKey-8x8} (sparse-reward sequential interaction)?
+    \item[\textbf{RQ3}] Which components of the world-model pipeline (transition loss, observation reconstruction, curiosity, imagination) are most responsible for observed behavior?
+\end{itemize}
+
+\subsection{Evaluation Protocol}
+
+Every \texttt{eval\_interval}$\,=\,$10{,}000 environment steps, we run \texttt{eval\_episodes} evaluation episodes in a separate environment instance and log mean return and mean episode length. Unless otherwise stated, we use 30 evaluation episodes for \textsc{DoorKey} and 100 for \textsc{MemoryS11}. Reported curves show the seed mean with $\pm 1$ standard deviation shading.
+
+\paragraph{Important implementation note.}
+Our current evaluation routine is \emph{stochastic on-policy evaluation with fixed seeds}, not greedy/deterministic evaluation, because actions are sampled from the policy distribution during evaluation.
+
+\subsection{Main Comparison}
+
+Figure~\ref{fig:memory} shows learning curves on \textsc{MemoryS11}.
+\textbf{[TODO: insert MemoryS11 reward/length plot for both methods.]}
+
+\begin{figure}[t]
+\centering
+% \includegraphics[width=\columnwidth]{figures/memory_main.pdf}
+\fbox{\parbox[c][4cm][c]{0.9\columnwidth}{\centering\small
+\textit{Placeholder.} MemoryS11: mean eval reward and mean episode length vs.\ environment steps. Recurrent PPO vs.\ World Model PPO, 3 seeds each, shaded $\pm 1$ std.
+}}
+\caption{Learning curves on \textsc{MemoryS11-v0}. Both methods reach comparable asymptotic return. The world-model agent appears smoother in some runs but can plateau at a slightly lower final mean return.}
+\label{fig:memory}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+% \includegraphics[width=\columnwidth]{figures/doorkey_main.pdf}
+\fbox{\parbox[c][4cm][c]{0.9\columnwidth}{\centering\small
+\textit{Placeholder.} DoorKey-8x8: mean eval reward vs.\ environment steps. Recurrent PPO vs.\ World Model PPO, 3 seeds each.
+}}
+\caption{Learning curves on \textsc{DoorKey-8x8-v0}. Neither method reaches consistent success within the training budget; seed variance is high, consistent with a strong sparse-reward exploration bottleneck.}
+\label{fig:doorkey}
+\end{figure}
+
+On \textsc{MemoryS11} (Figure~\ref{fig:memory}), both methods converge to approximately \textbf{[TODO]}. Recurrent PPO reaches this regime with \textbf{[TODO]} variance and \textbf{[TODO]} mean episode length, while the world-model agent reaches \textbf{[TODO]} with \textbf{[TODO]} mean episode length.
+
+On \textsc{DoorKey-8x8} (Figure~\ref{fig:doorkey}), neither method solves the task consistently within \textbf{[TODO]}M environment steps. We treat this as an informative negative result and analyze it in Section~\ref{sec:discussion}.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+Method & \textsc{MemoryS11} & \textsc{DoorKey-8x8} \\
+\midrule
+Recurrent PPO  & \textbf{[TODO]} $\pm$ [TODO] & [TODO] $\pm$ [TODO] \\
+World Model    & [TODO] $\pm$ [TODO] & [TODO] $\pm$ [TODO] \\
+\bottomrule
+\end{tabular}
+\caption{Mean final eval return ($\pm$ std across seeds) at the end of training.}
+\label{tab:final}
+\end{table}
+
+\subsection{Ablations on \textsc{DoorKey}}
+
+To diagnose the world-model agent's \textsc{DoorKey} failure mode, we ran the ablation suite in Table~\ref{tab:ablation}: (A) full world model; (B) $c_\text{cur}\!=\!0$; (C) $c_\text{o}\!=\!0$; (D) $H_\text{imag}\!=\!0$.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lc}
+\toprule
+Ablation & Final eval return \\
+\midrule
+(A) Full world model                     & [TODO] $\pm$ [TODO] \\
+(B) No curiosity ($c_\text{cur}=0$)      & [TODO] $\pm$ [TODO] \\
+(C) No obs prediction ($c_\text{o}=0$)   & [TODO] $\pm$ [TODO] \\
+(D) No imagination ($H_\text{imag}=0$)   & [TODO] $\pm$ [TODO] \\
+\bottomrule
+\end{tabular}
+\caption{\textsc{DoorKey-8x8} component ablations (\textbf{[TODO]}M steps, \textbf{[TODO]} seeds each).}
+\label{tab:ablation}
+\end{table}
+
+\section{Diagnostic Experiments}
+\label{sec:diagnostics}
+
+Three implementation/design choices produced measurable regressions in early experiments. We report each as a mini-experiment: hypothesis, result, diagnosis, implication.
+
+\subsection{BPTT Through the Transition Model in Imagination}
+
+\paragraph{Hypothesis.}
+Allowing policy/value gradients to flow through the transition model during imagination should make learned dynamics more task-relevant.
+
+\paragraph{Result.}
+After imagination engaged, transition loss increased by about $9\times$ (\textbf{$\approx 0.004 \rightarrow \approx 0.036$}) and \textsc{MemoryS11} eval return regressed from approximately $0.62$ to $0.30$ in the same training regime.
+
+\paragraph{Diagnosis.}
+In our simplified setup, imagination uses no learned reward model and relies primarily on critic bootstrap signal over imagined trajectories. This appears to introduce high-variance gradients that interfere with one-step supervised transition learning.
+
+\paragraph{Implication.}
+Our value-only imagination variant is unstable in this form. A more faithful Dreamer-style design would require a learned reward predictor (and likely stronger stabilization), or a gradient separation strategy where transition learning remains supervised.
+
+\subsection{Entropy Regularization on Sparse-Reward Tasks}
+
+\paragraph{Hypothesis.}
+A smaller entropy coefficient ($c_e=0.005$) should let policies commit earlier on \textsc{MemoryS11}.
+
+\paragraph{Result.}
+With low $c_e$, policy entropy stayed near $\log 7 \approx 1.946$ and return remained near $\sim 0.15$. With larger $c_e$ (e.g., $0.05$ in our later runs), entropy decreased from that near-uniform regime and return improved to $>0.6$ in successful seeds.
+
+\paragraph{Diagnosis.}
+Sparse rewards produce weak, noisy advantage signal; optimization is highly sensitive to the relative scale of entropy and policy-gradient terms. In our setup, low-entropy settings did not reliably produce stable policy improvement.
+
+\paragraph{Implication.}
+On sparse-reward POMDPs, entropy tuning is a first-order hyperparameter and should be swept early.
+
+\subsection{Detaching the GRU Hidden State from the Policy Gradient}
+
+\paragraph{Hypothesis.}
+Detaching belief state from PPO losses might stabilize representation learning by letting auxiliary world-model losses shape the encoder.
+
+\paragraph{Result.}
+\textsc{MemoryS11} failed under this configuration: returns remained near chance-like behavior despite normal convergence of auxiliary losses.
+
+\paragraph{Diagnosis.}
+Auxiliary objectives reward predictive content, not necessarily task-useful memory. The cue in \textsc{MemoryS11} is temporally delayed in utility, so policy-gradient signal through the recurrent state is required to preserve it.
+
+\paragraph{Implication.}
+Auxiliary world-model losses are helpful regularizers, but they do not replace end-to-end policy/critic gradients through the recurrent belief state.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{When does the world model help?}
+Our evidence suggests the strongest benefit appears on recall-heavy tasks where representation quality is limiting. On \textsc{MemoryS11}, auxiliary prediction losses can stabilize training and improve representation learning. On \textsc{DoorKey-8x8}, exploration remains the dominant bottleneck; better latent prediction alone does not solve sparse sequential interaction.
+
+\paragraph{Auxiliary losses versus imagination.}
+In our implementation, auxiliary transition/observation losses were generally beneficial or neutral as regularizers. Imagination (in value-only form) was often harmful, likely because its gradient signal was less grounded than supervised one-step prediction.
+
+\paragraph{Limitations.}
+Our model is a deterministic latent setup without stochastic latent variables, KL balancing, or learned reward prediction, so it is weaker than full Dreamer-style formulations. Compute limits also constrained seed count and ablation breadth, especially for high-variance \textsc{DoorKey} runs.
+
+\section{Conclusion}
+
+We compared Recurrent PPO and a deterministic world-model PPO variant with auxiliary transition/observation losses, optional curiosity, and optional imagination. On \textsc{MemoryS11}, both methods can reach similar asymptotic regimes, with world-model auxiliaries often improving training smoothness. On \textsc{DoorKey-8x8}, neither method solved the task robustly under our budget.
+
+The most informative outcome was diagnostic: (1) detaching recurrent state from PPO gradients breaks memory learning, (2) entropy scaling is critical in sparse-reward POMDPs, and (3) value-only imagination with transition BPTT can destabilize supervised dynamics learning. Overall, our results support using world-model losses as representation regularizers, while highlighting that robust imagination-based gains likely require a stronger model-based stack (especially learned reward prediction and better stabilization).

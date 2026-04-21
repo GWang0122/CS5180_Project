@@ -12,12 +12,12 @@ class Config:
             "MiniGrid-MemoryS11-v0",
         ]
     )
-    max_episode_steps: int = 256
+    max_episode_steps: int = 384
 
     # --- Training ---
-    total_timesteps: int = 5_000_000
+    total_timesteps: int = 10_000_000
     rollout_length: int = 256
-    num_envs: int = 16
+    num_envs: int = 48
     gamma: float = 0.99
     gae_lambda: float = 0.95
     seed: int = 42
@@ -29,11 +29,21 @@ class Config:
     vf_coef: float = 0.5
     ent_coef: float = 0.05
     max_grad_norm: float = 0.5
-    lr: float = 7e-4
+    lr: float = 3e-4
 
     # --- Network ---
     hidden_dim: int = 128
     tbptt_len: int = 16
+
+    # --- Imagination (model-based) ---
+    imagine_horizon: int = 0
+
+    # --- World Model Loss Coefficients ---
+    transition_coef: float = 0.1
+    obs_pred_coef: float = 0.1
+
+    # --- Curiosity (intrinsic motivation from world model) ---
+    curiosity_coef: float = 0.01
 
     # --- Evaluation ---
     eval_interval: int = 10_000

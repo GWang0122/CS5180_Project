@@ -1,12 +1,14 @@
 """TensorBoard + console logger shared by both algorithms."""
 
+import json
 import os
 import time
 from torch.utils.tensorboard import SummaryWriter
 
 
 class Logger:
-    def __init__(self, log_dir: str, algo_name: str, env_id: str, seed: int):
+    def __init__(self, log_dir: str, algo_name: str, env_id: str, seed: int,
+                 config: dict = None):
         run_name = f"{algo_name}_{env_id}_s{seed}_{int(time.time())}"
         self.tb_dir = os.path.join(log_dir, run_name)
         self.writer = SummaryWriter(self.tb_dir)
@@ -14,6 +16,13 @@ class Logger:
         self.env_id = env_id
         self.ep_count = 0
         print(f"Logging to {self.tb_dir}")
+
+        if config:
+            config_str = json.dumps(config, indent=2, default=str)
+            self.writer.add_text("config", f"```json\n{config_str}\n```", 0)
+            config_path = os.path.join(self.tb_dir, "config.json")
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=2, default=str)
 
     def log_scalar(self, tag: str, value: float, step: int):
         self.writer.add_scalar(tag, value, step)
