@@ -1,0 +1,45 @@
+% World Model Agent training (medium detail; matches world_model/train.py).
+% Compile: pdflatex -output-directory=docs docs\world_model_algorithm.tex
+% For \input: load amsmath, algorithm, algpseudocode, caption + \captionsetup below.
+
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{caption}
+\captionsetup[algorithm]{labelformat=empty, labelsep=none, font=small}
+
+\begin{document}
+
+\begin{algorithm}[t]
+\caption{World Model Agent --- one training update}
+\label{alg:world_model_train}
+\begin{algorithmic}[1]
+\State Belief: $h_t = \mathrm{GRU}\bigl([\mathrm{CNN}(o_t); \mathrm{Emb}(a_{t-1})], h_{t-1}\bigr)$;
+  policy $\pi(a|h)$, value $V(h)$; transition $f_\phi(h,a)$; observation head $g_\psi(h,a)$.
+\State Anneal learning rate linearly over training.
+\State \textbf{Rollout (real env, $N$ parallel, length $T$):}
+\For{$t = 1 \ldots T$}
+  \State Update $h$, sample $a \sim \pi(\cdot|h)$, store transitions; step environment.
+  \If{curiosity coefficient $> 0$ and step not terminal}
+    \State $r \gets r_{\mathrm{env}} + c_{\mathrm{cur}}\,\lVert g_\psi(h,a) - o'\rVert^2$
+  \EndIf
+  \State Reset $h$ where an episode ended.
+\EndFor
+\State Bootstrap last value; compute GAE advantages and normalize them.
+\State \textbf{PPO + world model ($K$ epochs):} replay trajectories, detach GRU state every $\tau$ steps (TBPTT).
+\State $\mathcal{L}_{\mathrm{PPO}}$: clipped surrogate on $\pi$; $\mathcal{L}_V = (V - R)^2$; entropy bonus.
+\State $\mathcal{L}_{\mathrm{trans}} = \|f_\phi(h_t,a_t) - h_{t+1}\|^2$,
+  $\mathcal{L}_{\mathrm{obs}} = \|g_\psi(h_t,a_t) - o_{t+1}\|^2$ (mask across episode boundaries).
+\State Joint loss $\mathcal{L} = \mathcal{L}_{\mathrm{PPO}} + \lambda_V \mathcal{L}_V - \lambda_H H(\pi)
+  + c_{\mathrm{trans}}\mathcal{L}_{\mathrm{trans}} + c_{\mathrm{obs}}\mathcal{L}_{\mathrm{obs}}$; Adam + grad clip.
+\State \textbf{Imagination (after warmup):} sample start beliefs from the replayed trajectory.
+\For{$j = 1 \ldots H_{\mathrm{imag}}$}
+  \State $a \sim \pi(\cdot|h)$;\quad $h \gets f_\phi(h,a)$ \Comment{no environment}
+\EndFor
+\State Second Adam step: on imagined $(h_j,a_j)$, minimize REINFORCE-style policy term $-\mathbb{E}[\log\pi \cdot A]$,
+  value error to GAE returns, and entropy ($A$ from zero rewards + bootstrap $V(h)$).
+\end{algorithmic}
+\end{algorithm}
+
+\end{document}

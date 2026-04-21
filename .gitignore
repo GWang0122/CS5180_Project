@@ -8,3 +8,8 @@ build/
 .env
 *.pt
 *.pth
+results.zip
+results/
+runs/
+*.pt
+events.out.tfevents.*
