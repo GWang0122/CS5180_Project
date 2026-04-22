@@ -1,15 +1,27 @@
 __pycache__/
 *.pyc
-runs/
 *.egg-info/
 .eggs/
 dist/
 build/
 .env
-*.pt
-*.pth
 results.zip
-results/
-runs/
-*.pt
+
+# Always ignore bulky TensorBoard event files, wherever they land
 events.out.tfevents.*
+
+# results/: ignore everything except CSVs and PNGs (report artifacts)
+results/**
+!results/**/
+!results/*.csv
+!results/*.png
+!results/**/*.csv
+!results/**/*.png
+
+# runs/: ignore everything except .pt checkpoints and config.json
+runs/**
+!runs/**/
+!runs/*.pt
+!runs/**/*.pt
+!runs/*.json
+!runs/**/config.json

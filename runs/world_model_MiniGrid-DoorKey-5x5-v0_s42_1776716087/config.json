@@ -1,0 +1,31 @@
+{
+  "env_ids": [
+    "MiniGrid-DoorKey-8x8-v0",
+    "MiniGrid-MemoryS11-v0"
+  ],
+  "max_episode_steps": 384,
+  "total_timesteps": 3000000,
+  "rollout_length": 256,
+  "num_envs": 48,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "seed": 42,
+  "ppo_epochs": 4,
+  "num_minibatches": 4,
+  "clip_eps": 0.2,
+  "vf_coef": 0.5,
+  "ent_coef": 0.025,
+  "max_grad_norm": 0.5,
+  "lr": 0.0003,
+  "hidden_dim": 256,
+  "tbptt_len": 32,
+  "imagine_horizon": 0,
+  "transition_coef": 0.25,
+  "obs_pred_coef": 0.25,
+  "curiosity_coef": 0.0,
+  "eval_interval": 10000,
+  "eval_episodes": 30,
+  "log_dir": "runs",
+  "env_id": "MiniGrid-DoorKey-5x5-v0",
+  "device": "cuda"
+}

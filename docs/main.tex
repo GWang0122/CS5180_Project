@@ -1,0 +1,869 @@
+%File: main.tex
+%AAAI 2026 style final project report
+%
+% USAGE: Drop this file into the AAAI 2026 Author Kit directory
+% (alongside aaai2026.sty and aaai2026.bst), or upload to Overleaf using
+% the official AAAI 2026 template and replace the main .tex file with this one.
+% Then: pdflatex main; bibtex main; pdflatex main; pdflatex main.
+
+\documentclass[letterpaper]{article}
+\usepackage{aaai2026}  % AAAI 2026 style
+\usepackage{times}
+\usepackage{helvet}
+\usepackage{courier}
+\usepackage[hyphens]{url}
+\usepackage{graphicx}
+\urlstyle{rm}
+\def\UrlFont{\rm}
+\usepackage{natbib}
+\usepackage{caption}
+\DeclareCaptionStyle{ruled}{labelfont=normalfont,labelsep=colon,strut=off}
+\frenchspacing
+\setlength{\pdfpagewidth}{8.5in}
+\setlength{\pdfpageheight}{11in}
+
+% Packages beyond what's in the AAAI style
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[section]{placeins}
+
+% --- Float placement tuning ---
+% AAAI's narrow two-column layout makes LaTeX very sensitive to float
+% placement. These settings keep floats near their reference text and
+% prevent the ``tables crammed against the bottom margin'' pattern.
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.8}
+\renewcommand{\textfraction}{0.07}
+\renewcommand{\floatpagefraction}{0.75}
+\setlength{\textfloatsep}{10pt plus 2pt minus 2pt}
+\setlength{\intextsep}{10pt plus 2pt minus 2pt}
+\renewcommand{\arraystretch}{1.08}
+
+\pdfinfo{
+/Title (Model-Based vs. Model-Free Reinforcement Learning in Partially Observable MiniGrid Environments)
+/Author (George Wang, Shreyas Suresh Manoti)
+/TemplateVersion (2026.1)
+}
+
+\setcounter{secnumdepth}{2}
+
+\title{Model-Based vs.\ Model-Free Reinforcement Learning in\\
+Partially Observable MiniGrid Environments}
+
+\author{
+    George Wang,\ Shreyas Suresh Manoti\\
+}
+\affiliations{
+    Northeastern University\\
+    CS 5180: Reinforcement Learning, Spring 2026\\
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We compare a recurrent model-free baseline (Recurrent PPO) against a
+deterministic world-model agent with Dyna-style imagination on three
+partially observable MiniGrid tasks: \textsc{DoorKey-5x5} and
+\textsc{DoorKey-8x8} (sequential object interaction at two difficulty
+scales) and \textsc{MemoryS11} (long-term recall). Both agents share the
+same CNN encoder and GRU belief backbone; the world-model agent adds a
+latent-transition head, an observation-reconstruction head, optional
+curiosity, and an imagination rollout that performs a second policy update
+on simulated trajectories. After controlled experiments we find that both
+methods solve \textsc{DoorKey-5x5} reliably (final mean return $\approx
+0.96$ for both), though Recurrent PPO actually reaches the $0.95$
+threshold about twice as fast as the world-model agent on this smallest
+variant; on \textsc{MemoryS11} both methods plateau near mean return
+$0.47$, which on this task corresponds to policies that do not reliably
+use the remembered cue; and neither method solves \textsc{DoorKey-8x8}
+reliably within the training budget ($0/2$ seeds reach goal-level return
+under either method). The world-model additions produce one measurable
+qualitative effect---a smoother, lower-variance learning curve on
+\textsc{MemoryS11}---but they do not raise the return ceiling on any of
+the three tasks. Our main contribution is a set of three
+diagnosed failure modes in the model-based pipeline---imagination through
+the transition model, insufficient entropy regularization, and detaching
+the belief state from the policy gradient---each of which we show to be a
+design trade-off rather than an implementation bug. A fourth contribution
+is a \emph{temporal retention probe} on \textsc{MemoryS11} that decodes the
+start-of-episode cue from the frozen belief state of a trained checkpoint
+and finds that cue identity is not linearly recoverable past the cue room,
+which mechanistically explains the $\approx 0.47$ plateau. Together these results
+argue that auxiliary dynamics losses supplement, but cannot replace,
+end-to-end gradient flow from the policy into the recurrent belief state,
+and that value-only imagination without a learned reward model is a
+brittle simplification of the Dreamer recipe.
+\end{abstract}
+
+\section{Introduction}
+
+Partially observable environments are a long-standing challenge for
+reinforcement learning (RL): the agent must infer latent state from a history
+of observations rather than a single frame, and sparse rewards make credit
+assignment across long horizons difficult. Two broad strategies dominate the
+literature. \emph{Model-free recurrent policies} such as Recurrent PPO
+\cite{schulman2017ppo} summarize history implicitly in a recurrent hidden
+state that is shaped only by the task reward. \emph{Model-based} agents such
+as PlaNet \cite{hafner2019planet} and Dreamer \cite{hafner2020dreamer} learn
+an explicit dynamics model and use it either for planning or for generating
+imagined rollouts on which the policy is further trained.
+
+The promise of the model-based approach is two-fold. First, the dynamics
+prediction objective acts as a representation-learning signal: the recurrent
+state is pressured to capture structure that is useful for predicting the
+future, not just for the next action. Second, imagined rollouts decouple
+policy improvement from environment interaction, potentially improving sample
+efficiency. Both claims come with caveats, which we examine empirically in
+this work.
+
+We study these two strategies on the \textsc{MiniGrid} suite
+\cite{minigrid}, specifically \textsc{DoorKey-5x5-v0},
+\textsc{DoorKey-8x8-v0}, and \textsc{MemoryS11-v0}. These tasks provide a
+controlled setting in which partial observability arises in different ways:
+\textsc{DoorKey} requires sequential object interaction (locate the key,
+toggle the door, reach the goal), while \textsc{MemoryS11} requires
+remembering an object observed at episode start and matching it with a cue
+observed later. Including both sizes of \textsc{DoorKey} lets us isolate
+the effect of exploration horizon from the effect of task structure: the
+5$\times$5 and 8$\times$8 variants share the same observation space and
+action space and differ only in room size and therefore in the number of
+random actions required to stumble on the key-then-door interaction. All
+three environments have sparse reward ($+1$ at the goal, $0$ otherwise,
+minus a small per-step penalty) and 7$\times$7$\times$3 local egocentric
+observations.
+
+Our contributions are:
+
+\begin{itemize}
+    \item A controlled comparison of Recurrent PPO and a deterministic
+    world-model agent (GRU belief state, latent-transition head,
+    observation-reconstruction head, optional curiosity, Dyna-style
+    imagination) under matched architecture and compute on
+    \textsc{DoorKey-5x5}, \textsc{DoorKey-8x8}, and \textsc{MemoryS11}.
+    \item Three diagnosed negative results---BPTT-through-transition
+    imagination, under-regularized entropy on sparse-reward tasks, and
+    detachment of the belief state from the policy gradient---each
+    quantified with the training scalars that identified them and mapped to
+    a concrete design implication.
+    \item An empirical argument that a purely deterministic world model with
+    value-only imagination is not a viable simplification of Dreamer: without
+    a learned reward model, imagination gradients are high-variance and
+    interfere destructively with the clean one-step prediction loss.
+\end{itemize}
+
+\section{Background}
+
+\subsection{POMDP Formulation}
+
+We model the environment as a partially observable MDP
+$(\mathcal{S}, \mathcal{A}, \mathcal{O}, T, R, \Omega, \gamma)$ with hidden
+state space $\mathcal{S}$ (agent pose, door/key status, goal location),
+discrete action space $\mathcal{A}$ (turn left/right, move forward, pick up,
+toggle), observation space $\mathcal{O}$ of 7$\times$7$\times$3 egocentric
+RGB views, transition kernel $T(s' \mid s, a)$, sparse reward $R(s,a)$,
+observation kernel $\Omega(o \mid s', a)$, and discount $\gamma \in [0,1)$.
+The agent maintains a history $h_t = (o_1, a_1, \ldots, o_t)$ and seeks
+a policy $\pi(a \mid h_t)$ maximizing
+$\mathbb{E}\left[\sum_{t=0}^{\infty} \gamma^t R(s_t, a_t)\right]$.
+
+\subsection{PPO and Recurrent PPO}
+
+Proximal Policy Optimization \cite{schulman2017ppo} optimizes a clipped
+surrogate objective
+\begin{equation*}
+    \mathcal{L}_{\text{PPO}} = \mathbb{E}_t\!\left[\min\!\big(r_t(\theta) \hat A_t,\;
+    \text{clip}(r_t(\theta), 1{-}\epsilon, 1{+}\epsilon)\hat A_t\big)\right]
+\end{equation*}
+with importance ratio $r_t(\theta) = \pi_\theta(a_t \mid s_t) / \pi_{\theta_\text{old}}(a_t \mid s_t)$
+and GAE advantages $\hat A_t$. Recurrent PPO additionally maintains a GRU
+hidden state, detaches the state at episode boundaries, and uses truncated
+backpropagation through time (TBPTT) during the K update epochs.
+
+\subsection{World Models}
+
+PlaNet \cite{hafner2019planet} introduced the Recurrent State-Space Model,
+combining a deterministic GRU path with a stochastic latent and using
+Cross Entropy Method planning in latent space. Dreamer
+\cite{hafner2020dreamer} replaced planning with an actor--critic trained
+on imagined latent rollouts, which requires a learned reward model.
+Our implementation is deliberately more minimal: we keep only the
+deterministic recurrent path, we supervise the belief state with both a
+next-hidden-state prediction loss and a next-observation reconstruction
+loss, and for imagination we rollout the transition head only (no reward
+model) and update the policy with GAE bootstrapped from the critic on
+zero-reward imagined trajectories. This simplification is a central object
+of study in the paper.
+
+\section{Related Work}
+
+Memory-Gym \cite{pleines2023memorygym} benchmarks recurrent architectures
+on memory-stressing grid worlds and finds that Recurrent PPO with
+appropriate TBPTT length is a strong baseline. On \textsc{DoorKey}, Raileanu
+and Rockt{\"a}schel's RIDE~\cite{raileanu2020ride} and related intrinsic
+motivation methods demonstrate that exploration, rather than representation
+learning, is the binding constraint as the room size grows. Our
+cross-scale \textsc{DoorKey} results (both methods solve 5$\times$5;
+neither solves 8$\times$8 reliably) are consistent with that literature:
+auxiliary prediction losses that help when exploration is cheap do not
+substitute for a dedicated exploration mechanism when it is not. The
+Dreamer line of work
+\cite{hafner2020dreamer, hafner2021dreamerv2, hafner2023dreamerv3} has
+extended latent imagination to a wide range of domains; we view our study
+as a diagnostic of what is lost when the stochastic latent, the KL balance,
+and the learned reward predictor of that family are removed.
+
+\section{Methods}
+
+Both agents share a CNN image encoder, an action embedding, a GRU cell for
+temporal integration, and an actor--critic head. They differ in whether
+the belief state is supervised by an explicit world model and whether a
+second update is performed on imagined rollouts.
+
+\subsection{Shared Backbone}
+
+The CNN follows the MiniGrid reference architecture from
+\texttt{rl-starter-files}: three $2\times 2$ convolutions (16$\to$32$\to$64
+channels) with a $2\times 2$ max-pool after the first conv, producing a
+64-dimensional feature. A linear layer projects this to the 64-dimensional
+observation embedding. Actions are embedded in a 16-dimensional space. The
+GRU cell takes the concatenation of observation and previous-action
+embeddings as input and produces the belief state $h_t$:
+\begin{equation}
+    h_t = \mathrm{GRU}\big(h_{t-1},\;[\text{CNN}(o_t);\; \text{Emb}(a_{t-1})]\big).
+\end{equation}
+The belief is reset to zero at episode boundaries. The actor and critic
+are two-layer MLPs with Tanh activations and orthogonal initialization
+(actor output gain $0.01$, critic output gain $1.0$).
+
+\subsection{Recurrent PPO Baseline}
+
+The baseline uses only the shared backbone. The objective is
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{\text{PPO}}
+                  + c_v\,\mathcal{L}_V
+                  - c_e\,H(\pi),
+\end{equation}
+with $\mathcal{L}_V = (V_\theta - R_t)^2$ and $H(\pi)$ the policy entropy.
+The belief state is rolled out in the environment with gradient flow
+through the recurrent cell, and TBPTT detaches the state every $\tau$ steps
+to bound computation. Advantages are GAE-normalized.
+
+\begin{algorithm}[!tbp]
+\caption{Recurrent PPO --- one training update}
+\label{alg:rppo}
+\begin{algorithmic}[1]
+\State Components: encoder $e_\omega$, belief $\mathrm{GRU}$, policy $\pi$,
+value $V$.
+\State \textbf{Rollout:} for $t = 1..T$ with $N$ parallel envs:
+\State \quad $h_t \gets \mathrm{GRU}(h_{t-1}, [e_\omega(o_t)])$;
+sample $a_t \sim \pi(\cdot \mid h_t)$; step envs.
+\State \quad Store $(o_t, a_t, r_t, h_t, \log\pi(a_t \mid h_t))$ in replay buffer.
+\State \quad Reset $h$ where episodes ended.
+\State Compute bootstrap value $V(h_T)$; compute GAE advantages; normalize.
+\State \textbf{PPO epoch} ($K$ times): replay trajectories, TBPTT every $\tau$ steps.
+\State \quad Re-run $\mathrm{GRU}$ from stored $h_0$; get new $\log\pi_\theta(a_t \mid h_t)$,
+$V_\phi(h_t)$.
+\State \quad Compute
+$\mathcal{L} = \mathcal{L}_{\text{CLIP}} + c_v \mathcal{L}_V - c_e H(\pi)$;
+Adam + grad clip.
+\State \quad $\mathcal{L}_{\text{CLIP}} = \mathbb{E}\!\left[\min\!\left(r_t \hat{A}_t,\,
+\mathrm{clip}(r_t, 1{-}\varepsilon, 1{+}\varepsilon)\hat{A}_t\right)\right]$,
+\hfill $r_t = \pi_\theta(a_t \mid h_t)\,/\,\pi_{\text{old}}(a_t \mid h_t)$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{World-Model Agent}
+
+The world-model agent adds two heads that share the belief state:
+\begin{align}
+    \hat h_{t+1} &= f_\phi(h_t,\, a_t) && \text{(transition)} \\
+    \hat o_{t+1} &= g_\psi(h_t,\, a_t) && \text{(observation predictor)}
+\end{align}
+and the corresponding losses
+$\mathcal{L}_{\text{trans}} = \lVert f_\phi(h_t, a_t) - h_{t+1}\rVert^2$
+and
+$\mathcal{L}_{\text{obs}} = \lVert g_\psi(h_t, a_t) - o_{t+1}\rVert^2$
+(masked at episode boundaries). The joint objective is
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{\text{PPO}} + c_v\,\mathcal{L}_V
+                  - c_e\,H(\pi)
+                  + c_\text{t}\mathcal{L}_{\text{trans}}
+                  + c_\text{o}\mathcal{L}_{\text{obs}}.
+\end{equation}
+Crucially, gradients from $\mathcal{L}_{\text{PPO}}$ flow back into the GRU
+cell, so the belief state is shaped by the policy gradient as well as by
+the prediction losses. An optional intrinsic reward
+$r_\text{cur} = c_\text{cur}\lVert g_\psi(h_t, a_t) - o_{t+1}\rVert^2$
+is added to the environment reward during rollout collection.
+
+\paragraph{Imagination.}
+After the first PPO update each epoch, we sample start beliefs from the
+replayed trajectory, roll out $H_{\text{imag}}$ steps through the transition
+model using the current policy (no environment calls, no reward model),
+and perform a second Adam step with a REINFORCE-style policy term,
+value error against GAE returns computed from zero imagined rewards plus
+the critic's bootstrap at the horizon, and an entropy bonus.
+
+\subsection{Training Loop}
+
+Algorithm~\ref{alg:wm} summarizes one training iteration. Optimization uses
+Adam with linear LR annealing, global gradient clipping at $0.5$, and
+orthogonal weight initialization throughout. Rollouts are collected with
+$N = 48$ vectorized environments over $T = 256$ steps, giving a batch of
+$12{,}288$ transitions per update.
+
+\begin{algorithm}[!tbp]
+\caption{World Model Agent --- one training update}
+\label{alg:wm}
+\begin{algorithmic}[1]
+\State Components: encoder $e_\omega$, belief $\mathrm{GRU}$, policy $\pi$,
+value $V$, transition $f_\phi$, obs head $g_\psi$.
+\State \textbf{Rollout:} for $t = 1..T$ with $N$ parallel envs:
+\State \quad $h_t \gets \mathrm{GRU}(h_{t-1},[e_\omega(o_t);\mathrm{Emb}(a_{t-1})])$;
+sample $a_t \sim \pi(\cdot\mid h_t)$; step envs.
+\State \quad If $c_\text{cur}>0$: add
+$c_\text{cur}\lVert g_\psi(h_t,a_t)-o_{t+1}\rVert^2$ to $r_t$.
+\State \quad Reset $h$ where episodes ended.
+\State Compute GAE advantages; normalize.
+\State \textbf{PPO epoch} ($K$ times): replay trajectories, TBPTT every $\tau$ steps.
+\State \quad Compute
+$\mathcal{L} = \mathcal{L}_{\text{PPO}} + c_v\mathcal{L}_V - c_e H(\pi)
+  + c_\text{t}\mathcal{L}_{\text{trans}} + c_\text{o}\mathcal{L}_{\text{obs}}$;
+Adam + grad clip.
+\State \textbf{Imagination} (after warmup): sample $h$ from buffer.
+\State \quad For $j = 1..H_{\text{imag}}$: $a\sim\pi(\cdot\mid h)$,
+$h \gets f_\phi(h, a)$.
+\State \quad Second Adam step: REINFORCE policy term, value loss vs.\ GAE
+on zero imagined rewards with $V(h)$ bootstrap, entropy bonus.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Hyperparameters}
+
+Table~\ref{tab:hparams} lists the settings used for the main comparison.
+These values are the result of the diagnostic work described in
+Section~\ref{sec:diagnostics}; earlier configurations are reported there
+as diagnosed failures.
+
+\begin{table}[!tbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccc}
+\toprule
+ & \textsc{DoorKey-5x5} & \textsc{DoorKey-8x8} & \textsc{MemoryS11} \\
+\midrule
+Total steps & 3\,M & 10\,M & 10\,M \\
+Parallel envs $N$ & 16 & 48 & 48 \\
+Rollout length $T$ & 256 & 256 & 256 \\
+Discount $\gamma$ & 0.99 & 0.99 & 0.99 \\
+GAE $\lambda$ & 0.95 & 0.95 & 0.95 \\
+Learning rate & $7\!\times\!10^{-4}$ & $3\!\times\!10^{-4}$ & $3\!\times\!10^{-4}$ \\
+PPO epochs $K$ & 4 & 4 & 4 \\
+Minibatches & 4 & 4 & 4 \\
+Clip $\epsilon$ & 0.2 & 0.2 & 0.2 \\
+Max grad norm & 0.5 & 0.5 & 0.5 \\
+Max episode steps & 256 & 384 & 256 \\
+Eval episodes & 30 & 30 & 100 \\
+Entropy coef $c_e$ & 0.05 & 0.025 & 0.08 \\
+Hidden dim & 128 & 256 & 256 \\
+TBPTT length $\tau$ & 16 & 32 & 64 \\
+Transition coef $c_\text{t}$ & 0.1 & 0.25 & 0.25 \\
+Obs-pred coef $c_\text{o}$ & 0.1 & 0.25 & 0.25 \\
+Curiosity coef $c_\text{cur}$ & 0.0 & 0.0 & 0.005 \\
+Imagine horizon $H_\text{imag}$ & 0 & 0 & 0 \\
+\bottomrule
+\end{tabular}
+\caption{Hyperparameters for the main comparison. \textsc{DoorKey-5x5} uses a dedicated sanity preset and a shorter budget because both methods converge early. The \textsc{DoorKey-8x8} column lists the preset we would use for a clean re-run; the actual \textsc{DoorKey-8x8} runs reported in Section~\ref{sec:experiments} come from an earlier exploratory phase that predated this preset (see the footnote in that paragraph for the exact per-run settings). The \textsc{MemoryS11} column lists the post-diagnostic preset used for the main MemoryS11 runs. Imagine horizon was set to 0 for final runs following the diagnostics in Section~\ref{sec:diagnostics}.}
+\label{tab:hparams}
+\end{table}
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Research Questions}
+
+\begin{itemize}
+    \item[\textbf{RQ1}] Does the world-model agent learn faster or reach
+    higher return than Recurrent PPO on \textsc{MemoryS11} (recall-heavy
+    POMDP)?
+    \item[\textbf{RQ2}] Do the world-model auxiliary signals confer an
+    advantage on \textsc{DoorKey}, and does that advantage survive as the
+    exploration horizon grows from 5$\times$5 to 8$\times$8?
+    \item[\textbf{RQ3}] Which components of the world-model pipeline
+    (transition loss, observation reconstruction, curiosity, imagination)
+    are individually responsible for the observed behaviour?
+\end{itemize}
+
+\subsection{Evaluation Protocol}
+
+Every \texttt{eval\_interval}$\,=\,$10{,}000 environment steps we run
+\texttt{eval\_episodes} stochastic on-policy evaluation episodes in a
+separate vectorized env (30 for both \textsc{DoorKey} sizes, 100 for
+\textsc{MemoryS11}) and log mean return and mean episode length. Actions
+during evaluation are sampled from $\pi(\cdot\mid h_t)$ rather than taken
+greedily, which keeps the reported return consistent with the on-policy
+objective being optimized. Each configuration is run with multiple seeds;
+reported curves show the seed mean with $\pm 1$ standard deviation shading.
+
+\subsection{Main Comparison}
+
+We organize the results by increasing difficulty: \textsc{DoorKey-5x5}
+(both methods succeed), \textsc{MemoryS11} (both methods succeed,
+world model learns more smoothly), and \textsc{DoorKey-8x8}
+(neither method succeeds reliably).
+
+\paragraph{\textsc{DoorKey-5x5}.}
+Figure~\ref{fig:doorkey5} plots logged mean episode reward against
+environment steps on the smaller \textsc{DoorKey} variant. Both curves
+average seeds~0 and~42 (for the world model, seed~42 is linearly
+interpolated onto seed~0's step grid before averaging). Both runs
+approach near-optimal return under our settings; the averaged model-free
+curve reaches mean eval return $\geq 0.95$ at approximately
+$1.4\!\times\!10^5$ environment steps, whereas the averaged world-model
+curve does so at approximately $3.0\!\times\!10^5$ steps, and both
+converge to essentially the same asymptote (mean final return $0.965$
+for Recurrent PPO, $0.961$ for the world-model agent). On this smallest
+\textsc{DoorKey} variant the world-model agent is therefore \emph{not}
+more sample-efficient than the recurrent baseline---it is in fact
+slower to cross the $0.95$ line---but its curve is visibly smoother,
+consistent with a regularizing effect of the auxiliary losses rather
+than a sample-efficiency gain.
+
+\begin{figure}[!tbp]
+\centering
+% PNG lives next to the repo under results/ (path is relative to this file in docs/).
+\includegraphics[width=\columnwidth]{5x5.png}
+\caption{\textsc{DoorKey-5x5-v0} training curves: mean episode reward vs.\
+environment steps. Each line is the mean over seeds~0 and~42 for that
+method.}
+\label{fig:doorkey5}
+\end{figure}
+
+\paragraph{\textsc{MemoryS11}.}
+Figure~\ref{fig:memory} shows the learning curves on \textsc{MemoryS11}.
+Both methods converge to a mean eval return of approximately $0.47$
+(Recurrent PPO $0.464\!\pm\!0.017$, world model $0.471\!\pm\!0.053$,
+measured over the final $10\%$ of eval points, seed-averaged over
+seeds~0 and~42), well short of the $\geq 0.9$ level that would indicate
+reliable use of the remembered cue. We interpret this plateau as evidence
+that the policy has learned to reach the correct half of the room more
+often than chance (producing a return above the pure-random floor) but
+has not learned a stable mapping from the early observation of the target
+object to the correct later action. The two methods differ in the
+\emph{shape} of learning rather than in its ceiling: the Recurrent PPO
+curve reaches the plateau slightly earlier but with larger early
+oscillations, while the world-model agent's curve climbs more slowly and
+is smoother in the mid-training regime. Seed-to-seed variance at
+convergence is comparable in magnitude for the two methods. The headline
+finding, however, is that neither method reliably solves
+\textsc{MemoryS11} under our configuration; the auxiliary world-model
+objectives do not provide enough signal to push performance past the
+apparent local optimum at $\approx 0.47$.
+
+\begin{figure}[!tbp]
+\centering
+\includegraphics[width=\columnwidth]{memory.png}
+\caption{\textsc{MemoryS11-v0} evaluation curves: mean eval return vs.\
+environment steps. Each line averages seeds~0 and~42 for that method.}
+\label{fig:memory}
+\end{figure}
+
+\paragraph{\textsc{DoorKey-8x8}.}
+Figure~\ref{fig:doorkey} shows that neither method solves
+\textsc{DoorKey-8x8} reliably within the training budget. The two
+world-model seeds reported here were launched during the diagnostic
+phase of the project and used different hyperparameter bundles from
+each other and from the preset in Table~\ref{tab:hparams};
+Table~\ref{tab:doorkey8_configs} lists the actual per-seed settings, which
+are also preserved in the saved run configs. We therefore treat these
+runs as an exploratory observation rather than a controlled comparison.
+Mean return across seeds over the final $10\%$ of evaluations is
+essentially $0$ for both methods ($0.000\!\pm\!0.000$ for Recurrent PPO,
+$0.000\!\pm\!0.000$ for the world-model agent), and $0$ of $2$ seeds
+reach goal-level return under either method within the training budget.
+The stabilization effect we saw on 5$\times$5---where the world-model
+agent produced a smoother learning curve at the same asymptote---does
+not translate into solving 8$\times$8: when the room grows from
+5$\times$5 to 8$\times$8, the expected number of random-policy steps
+needed to execute the key-then-door sequence grows super-linearly, and
+the auxiliary prediction losses---whose gradient magnitude does not
+scale with task difficulty---do not substitute for a directed
+exploration mechanism.
+This is our most informative negative result, and we analyze it further
+in Section~\ref{sec:discussion}.
+
+\begin{figure}[!tbp]
+\centering
+\includegraphics[width=\columnwidth]{8x8.png}
+
+\caption{Learning curves on \textsc{DoorKey-8x8-v0}. Neither method
+reaches any success within the training budget: mean eval return stays
+at $0$ across the two seeds per method that we report, consistent with
+the well-known exploration bottleneck of sparse-reward
+sequential-interaction tasks at this scale.}
+\label{fig:doorkey}
+\end{figure}
+
+\begin{table}[!tbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcc}
+\toprule
+Hyperparameter       & Seed 0 & Seed 42 \\
+\midrule
+Learning rate        & $10^{-4}$ & $10^{-4}$ \\
+Hidden dim           & 256       & 128       \\
+TBPTT length $\tau$  & 32        & 16        \\
+Rollout length $T$   & 128       & 128       \\
+Imagine horizon      & 3         & 3         \\
+Transition coef      & 0.25      & 0.1       \\
+Obs-pred coef        & 0.25      & 0.1       \\
+Entropy coef         & 0.025     & 0.05      \\
+Curiosity coef       & 0         & 0.03      \\
+\bottomrule
+\end{tabular}
+\caption{Actual per-seed hyperparameters used for the two
+\textsc{DoorKey-8x8} world-model runs reported in this paper. These
+differ both from each other and from the \textsc{DoorKey-8x8} column of
+Table~\ref{tab:hparams}, which lists the preset we would use for a clean
+re-run.}
+\label{tab:doorkey8_configs}
+\end{table}
+
+\begin{table}[!tbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lccc}
+\toprule
+Method & \textsc{DK-5x5} & \textsc{MemoryS11} & \textsc{DK-8x8} \\
+\midrule
+Recurrent PPO  & $0.965\!\pm\!0.00$ & $0.464\!\pm\!0.02$ & $0.000\!\pm\!0.00$ \\
+World Model    & $0.961\!\pm\!0.00$ & $0.471\!\pm\!0.05$ & $0.000\!\pm\!0.00$ \\
+\bottomrule
+\end{tabular}
+\caption{Mean final eval return (seed-averaged over seeds~0 and~42,
+$\pm$ standard deviation of the seed-averaged curve over the last $10\%$
+of eval points) at the end of training. \textsc{DK} abbreviates
+\textsc{DoorKey}.}
+\label{tab:final}
+\end{table}
+
+\subsection{Configuration Comparison on \textsc{MemoryS11}}
+\label{sec:ablation}
+
+A controlled single-factor ablation on \textsc{DoorKey-8x8} was not
+feasible within our compute budget: each of our exploratory
+\textsc{DoorKey-8x8} runs shipped with a different bundle of
+hyperparameters (see the footnote in the \textsc{DoorKey-8x8} paragraph of
+Section~\ref{sec:experiments}), which confounds component-level
+attribution. We instead summarize the empirical effect of the two
+hyperparameter changes that moved \textsc{MemoryS11} performance the most
+during tuning, using pairs of runs from our training logs. These are
+\emph{natural-configuration comparisons}, not randomized ablations: other
+hyperparameters were not held perfectly fixed, so Table~\ref{tab:ablation}
+should be read as ``the direction and approximate magnitude we observed
+after a single-factor change,'' not ``the causal effect of flipping one
+knob in isolation.''
+
+\begin{table}[!tbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{0.26\columnwidth}p{0.42\columnwidth}p{0.20\columnwidth}}
+\toprule
+Change & Accompanying settings & Effect on return \\
+\midrule
+$H_\text{imag}{:}\,3{\to}0$ (turn off imagination)
+  & also raised $c_\text{t}{=}c_\text{o}$ from $0.15/0.5$ to $0.25$
+    and $c_e$ from $0.005$ to $0.05$--$0.08$
+  & ${\approx}\,0.3{\to}0.5$ (stable) \\
+$c_e{:}\,0.005{\to}0.05$ (raise entropy coef)
+  & otherwise identical run family
+  & ${\approx}\,0.15{\to}0.6$ (see Sec.~\ref{sec:diagnostics}) \\
+\bottomrule
+\end{tabular}
+\caption{\textsc{MemoryS11} natural-configuration changes and their
+observed effect on end-of-training mean evaluation return. Both rows
+summarize multiple tuning runs rather than paired single-factor
+ablations; the training logs backing each row are
+\texttt{runs/world\_model\_MiniGrid-MemoryS11-v0\_*} and are preserved
+with their \texttt{config.json} for inspection.}
+\label{tab:ablation}
+\end{table}
+
+\subsection{Temporal Retention Probe on \textsc{MemoryS11}}
+\label{sec:probe}
+
+To distinguish \emph{belief-state failure} (the GRU forgets the cue) from
+\emph{policy-head failure} (the GRU remembers the cue but the policy fails
+to condition on it), we train a linear probe on the frozen belief state
+of a trained \textsc{MemoryS11} checkpoint. This requires no additional
+training runs.
+
+\paragraph{Setup.}
+We load the seed-0 \textsc{MemoryS11} world-model checkpoint
+(hidden dim 256, post-diagnostic preset, mean eval return $\approx 0.47$),
+roll it out for 400 fresh episodes under a seed band disjoint from
+training (seed 20{,}000) and in-training evaluation (seed 10{,}000), and
+record tuples $(h_t, y, t)$ where $y \in \{0,1\}$ is the identity of the
+cue object (Ball vs.\ Key) placed in the starting room at grid position
+$(1,4)$. We bin by step-within-episode and fit a logistic regression
+probe from $h_t$ to $y$ per bin. Episodes are partitioned 70/30 at the
+episode level (not at the timestep level) to prevent train--test
+contamination. As a sanity check we run the identical pipeline with a
+freshly initialized, untrained model.
+
+\paragraph{Result.}
+Table~\ref{tab:probe} reports probe test accuracy per bin together with
+the per-bin majority-class baseline (unbalanced class frequencies in the
+test split are a function of the trained policy's behaviour and so
+differ across bins). In the cue-room phase the trained belief state lifts
+probe accuracy about three points above majority, which we read as
+``the cue is present in $h_t$ while the agent can still see it.'' From
+the corridor onward, probe accuracy in the trained model drops to (or
+below) majority: the cue is \emph{not} linearly decodable from $h_t$ at
+the junction, where the decision is actually being made.
+
+\begin{table}[!tbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccc}
+\toprule
+Bin (step $t$) & $n_\text{test}$ & Maj. & \multicolumn{2}{c}{Probe test acc.} \\
+\cmidrule(lr){4-5}
+ & & base & Trained & Rand.\ init \\
+\midrule
+cue-room (0--4)       & 598  & 0.518 & 0.548 & 0.511 \\
+corridor-early (5--14)  & 999  & 0.527 & 0.529 & 0.594 \\
+corridor-mid (15--29)   & 659  & 0.619 & 0.470 & 0.571 \\
+junction (30--59)      & 219  & 0.758 & 0.265 & 0.465 \\
+late (60+)             & --   & --    & --    & 0.442 \\
+\bottomrule
+\end{tabular}
+\caption{\textsc{MemoryS11} temporal retention probe: logistic regression
+from $h_t$ to cue identity. ``Maj.\ base'' is the per-bin majority-class
+accuracy on the test set; a probe with no information content would match
+it. The trained checkpoint recovers the cue barely above majority only in
+the cue-room phase; by the junction, where the cue must be used,
+accuracy is at or below the majority baseline. The \emph{late} row is
+populated only by the random-init baseline because the trained policy
+typically terminates episodes before $t\!=\!60$.}
+\label{tab:probe}
+\end{table}
+
+\paragraph{Interpretation.}
+The probe is a direct test of whether the belief state carries the
+information the junction decision would need; in our trained checkpoint
+it does not. Combined with the fact that evaluation return plateaus
+exactly at the level expected for a policy that cannot condition on the
+cue, this pinpoints the failure as \emph{belief-state forgetting},
+not policy-head miscalibration. It also complements the qualitative
+finding in Section~\ref{sec:diagnostics} that detaching the GRU from the
+policy gradient makes the task unsolvable: even with the GRU attached,
+the current training regime does not shape the belief strongly enough
+to preserve the cue across 30+ steps of corridor traversal.
+
+\section{Diagnostic Experiments}
+\label{sec:diagnostics}
+
+Three design choices produced measurable regressions in early experiments
+and became the most informative findings of the project. We report each
+as a mini-experiment: hypothesis, quantitative result, mechanistic
+diagnosis, and implication.
+
+\subsection{BPTT Through the Transition Model in Imagination}
+
+\paragraph{Hypothesis.} Letting policy and value gradients flow through the
+transition model during imagination should make the dynamics task-relevant
+rather than merely predictive, as in Dreamer.
+
+\paragraph{Result.} Enabling imagination increased the transition loss by
+roughly $9\times$ (\textbf{from $\approx 0.004$ to $\approx 0.036$}) once
+the imagination phase engaged, and mean evaluation return regressed from
+approximately $0.62$ to $0.30$ on \textsc{MemoryS11} within the same
+training budget.
+
+\paragraph{Diagnosis.} In our simplified setup the imagination rollout has
+no learned reward model, so the only gradient signal reaching the policy
+is the critic bootstrap $V(h_{t+H})$ evaluated on an imagined trajectory
+with zero reward in its interior. This is a high-variance REINFORCE-style
+estimator. When backpropagated through the transition network $f_\phi$,
+this noisy signal competes with the clean one-step MSE prediction loss
+and, empirically, dominates it: the transition model is pulled toward
+whatever latent paths make the policy gradient cheaper, regardless of
+physical consistency.
+
+\paragraph{Implication.} Value-only imagination with BPTT through a
+deterministic transition model is not a viable simplification of Dreamer.
+Recovering the imagination benefit would require either (i) a learned
+reward predictor---restoring the full Dreamer loop---or (ii) detaching the
+transition network from the imagination policy gradient so that dynamics
+prediction remains a clean auxiliary task. We adopt $H_\text{imag}\!=\!0$
+in our final runs as the minimum-intervention fix.
+
+\subsection{Entropy Regularization on Sparse-Reward Tasks}
+
+\paragraph{Hypothesis.} A small entropy coefficient ($c_e\!=\!0.005$)
+should let the policy commit confidently on \textsc{MemoryS11} once it
+discovers the correct object--cue association.
+
+\paragraph{Result.} Policy entropy plateaued at $\log 7 \approx 1.946$, i.e.,
+the uniform distribution over actions, and evaluation return stuck near
+$0.15$ for the entire training budget. Raising the coefficient to
+$c_e\!=\!0.05$ dropped entropy to approximately $1.71$ and mean return
+climbed past $0.6$.
+
+\paragraph{Diagnosis.} With sparse binary reward, GAE advantages are
+nearly zero for most samples; normalization does not fix this because it
+rescales all advantages together. At $c_e\!=\!0.005$ the tiny policy
+gradient is still dominated by the entropy bonus gradient, but with the
+wrong sign: the policy is being pushed \emph{toward} uniform more strongly
+than it is being pulled toward any particular action. Raising $c_e$ does
+not ``encourage more exploration''---the policy is already maximally
+exploratory---it changes the \emph{balance} so that signal from rare
+rewarding trajectories is no longer drowned out.
+
+\paragraph{Implication.} On sparse-reward POMDPs the
+policy-gradient/entropy-gradient balance is a first-order hyperparameter,
+not a fine-tuning detail. Sweeping $c_e$ across an order of magnitude is
+probably more important than sweeping the learning rate or clip range.
+
+\subsection{Detaching the GRU Hidden State from the Policy Gradient}
+
+\paragraph{Hypothesis.} Detaching the belief state from the PPO loss
+would keep PPO updates cheap and insulate the encoder from policy-gradient
+noise, letting the reconstruction and transition losses shape
+representations on their own.
+
+\paragraph{Result.} \textsc{MemoryS11} was unsolvable under this
+configuration across all seeds tried: mean return never moved above chance,
+despite the reconstruction and transition losses converging normally.
+
+\paragraph{Diagnosis.} The reconstruction and transition objectives are
+\emph{content}-preserving: they reward the belief state for preserving
+whatever is locally predictable about the next observation and the next
+hidden state. Neither penalizes forgetting information that is not
+immediately useful for prediction. In \textsc{MemoryS11} the critical
+latent variable---the object seen at episode start---is locally irrelevant
+for many time steps, so the reconstruction loss has no incentive to
+maintain it in the belief state. Only the policy gradient, flowing back
+through the GRU from the later action choice where the memory pays off,
+can shape the belief to be \emph{task-useful}.
+
+\paragraph{Implication.} Auxiliary world-model losses supplement, but
+cannot replace, end-to-end gradient flow from the policy into the
+recurrent cell. This is consistent with the behaviour of Dreamer and its
+successors, all of which train the belief state with actor and critic
+gradients in addition to reconstruction and KL terms.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{When does the world model help?}
+Our results across the three environments suggest that the benefit of a
+learned world model tracks a single axis: how much the bottleneck is
+\emph{representation} versus \emph{exploration}, but with an important
+caveat that both axes can bite simultaneously. On \textsc{DoorKey-5x5},
+where a random policy can stumble on the key-then-door sequence with
+non-negligible probability, the auxiliary transition and observation
+losses do not accelerate time-to-solve---the model-free baseline in fact
+crosses the $0.95$ return line about twice as fast as the world-model
+agent---but they do visibly smooth the learning curve and slightly
+reduce seed-to-seed variance. Representation pressure is a real effect
+on this task, it just shows up as a stability bonus rather than as a
+sample-efficiency gain. On \textsc{MemoryS11}, the auxiliary reconstruction
+objective does pressure the belief to encode visual features of the
+recalled object while it is in view, but neither method pushes past a
+mean return of $\approx 0.47$. Our temporal retention probe
+(Section~\ref{sec:probe}) makes this concrete: the cue is barely above
+majority-class decodable from $h_t$ while the agent is in the cue room,
+and at or below majority by the junction. Representation-shaping from
+the reconstruction loss is therefore not sufficient on its own to keep
+the cue in the belief state through 30+ steps of corridor traversal,
+which is exactly the horizon over which credit must be assigned to solve
+the task. On
+\textsc{DoorKey-8x8}, neither advantage matters: the problem is that the
+agent rarely sees a successful trajectory at all. Auxiliary prediction
+losses do not redistribute sparse rewards, and their gradient magnitude
+does not grow with task difficulty. This pattern matches prior
+observations in the MiniGrid literature that intrinsic motivation
+specifically targeted at novel state visitation, rather than prediction
+error per se, is what moves the needle on larger \textsc{DoorKey}
+variants, and suggests that a similar directed-exploration component is
+what \textsc{MemoryS11} needs to cross the $\approx 0.47 \to 0.9$ gap.
+
+\paragraph{Auxiliary losses versus imagination.}
+The two world-model ingredients played qualitatively different roles. The
+auxiliary losses (transition and observation prediction) had a
+regularizing effect: they did not raise the ceiling on \textsc{MemoryS11}
+but they produced a smoother learning curve and lower per-step variance.
+Imagination, at least in our value-only form, was actively harmful---the
+BPTT-through-transition result in Section~\ref{sec:diagnostics} shows that
+policy improvement on noisy imagined trajectories destabilizes the
+dynamics model. A cleaner imagination design would separate the two
+gradient paths: let the transition model be trained only by its one-step
+prediction loss, and let the policy update on imagined rollouts without
+propagating its gradient into $f_\phi$.
+
+\paragraph{Limitations.}
+Our implementation uses a purely deterministic belief with no stochastic
+latent, no KL balance, and no learned reward model. These simplifications
+were deliberate---we wanted to isolate the effect of the auxiliary
+losses---but they also make our world-model agent a strictly weaker
+version of Dreamer. The negative results on imagination should be read as
+statements about this specific, minimalist design, not about
+imagination-based RL in general. Compute constraints limited us to
+2 seeds per configuration, and the \textsc{DoorKey} results
+have high seed variance; a more rigorous study would use 5--10 seeds and
+a larger training budget.
+
+\section{Conclusion}
+
+We compared Recurrent PPO against a deterministic world-model agent with
+auxiliary prediction losses, optional curiosity, and Dyna-style
+imagination on three partially observable MiniGrid tasks at two levels of
+exploration difficulty. Both methods solve \textsc{DoorKey-5x5} to the
+same asymptote (mean final return $\approx 0.96$), though on this task
+the recurrent model-free baseline actually reaches the $0.95$ threshold
+about twice as fast as the world-model agent; the world-model agent's
+advantage on \textsc{DoorKey-5x5} is qualitative (smoother, lower-variance
+curve), not a sample-efficiency win. On \textsc{MemoryS11} both methods
+plateau at mean return $\approx 0.47$, short of reliable recall; the
+world-model agent's curve is somewhat smoother in the mid-training
+regime but the ceiling is the same. On \textsc{DoorKey-8x8} neither
+method succeeds reliably---$0$ of $2$ seeds reach goal-level return
+under either method. The world-model additions thus produce one
+measurable qualitative effect---smoother learning---but do not accelerate
+time-to-solve on any task and do not expand the set of tasks that are
+solvable under our implementation. The most valuable
+output of the project was a set of three diagnosed design trade-offs,
+plus one post-hoc analysis of the belief state itself. The design
+trade-offs are: value-only imagination with BPTT through a deterministic
+transition model is unstable because it confounds dynamics learning with
+a noisy policy gradient; under-regularized entropy on sparse-reward tasks
+collapses policy learning rather than producing confident policies; and
+detaching the belief state from the policy gradient makes memory tasks
+unsolvable because auxiliary losses reward predictive utility, not task
+utility. The analysis is a temporal retention probe on \textsc{MemoryS11}
+that shows the cue identity is not linearly recoverable from the belief
+state by the time the junction decision must be made, localizing the
+$\approx 0.47$ plateau to belief-state forgetting rather than to a policy-head
+failure.
+Together these findings support a simple thesis: auxiliary world-model
+objectives are useful as representation regularizers that pay off when
+exploration is not the bottleneck, but they complement---they do not
+substitute for---end-to-end policy-gradient training of the recurrent
+belief state, and they cannot substitute for a dedicated exploration
+mechanism when reward is sparse and the horizon is long.
+
+\bibliography{refs}
+
+\end{document}
